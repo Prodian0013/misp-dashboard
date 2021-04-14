@@ -1,6 +1,7 @@
 argparse
 flask
 flask-login
+requests_oauthlib
 wtforms
 geoip2
 redis
@@ -11,3 +12,4 @@ zmq
 requests
 halo
 pyopenssl
+gunicorn

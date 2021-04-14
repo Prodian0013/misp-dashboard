@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+
 import configparser
 import datetime
 import uuid
@@ -16,8 +17,9 @@ from time import sleep, strftime
 import redis
 
 import util
+from requests_oauthlib import OAuth2Session
 from flask import (Flask, Response, jsonify, render_template, request, make_response,
-                   send_from_directory, stream_with_context, url_for, redirect)
+                   send_from_directory, stream_with_context, url_for, redirect, session)
 from flask_login import (UserMixin, LoginManager, current_user, login_user, logout_user, login_required)
 from helpers import (contributor_helper, geo_helper, live_helper,
                      trendings_helper, users_helper)
@@ -43,21 +45,21 @@ except:
     server_ssl_cert = None
     server_ssl_key = None
     pass
-auth_host = cfg.get("Auth", "misp_fqdn")
-auth_enabled = cfg.getboolean("Auth", "auth_enabled")
+
+client_id = cfg.get("Auth", "client_id")
+authorization_base_url = cfg.get("Auth", "authorization_base_url")
+token_url = cfg.get("Auth", "token_url")
 auth_ssl_verify = cfg.getboolean("Auth", "ssl_verify")
 auth_session_secret = cfg.get("Auth", "session_secret")
-auth_session_cookie_secure = cfg.getboolean("Auth", "session_cookie_secure")
-auth_session_cookie_samesite = cfg.get("Auth", "session_cookie_samesite")
-auth_permanent_session_lifetime = cfg.getint("Auth", "permanent_session_lifetime")
+
+if "client_secret" in os.environ:
+    client_secret = os.environ.get("client_secret")
+else:
+    client_secret = cfg.get("Auth", "client_secret")
 
 app = Flask(__name__)
-#app.secret_key = auth_session_secret
 app.config.update(
-    SECRET_KEY=auth_session_secret,
-    SESSION_COOKIE_SECURE=auth_session_cookie_secure,
-    SESSION_COOKIE_SAMESITE=auth_session_cookie_samesite,
-    PERMANENT_SESSION_LIFETIME=timedelta(days=auth_permanent_session_lifetime)
+    SECRET_KEY=auth_session_secret
 )
 
 redis_server_log = redis.StrictRedis(
@@ -97,68 +99,6 @@ class User(UserMixin):
     def __init__(self, id, password):
         self.id = id
         self.password = password
-
-    def misp_login(self):
-        """
-        Use login form data to authenticate a user to MISP.
-
-        This function uses requests to log a user into the MISP web UI. When authentication is successful MISP redirects the client to the '/users/routeafterlogin' endpoint. The requests session history is parsed for a redirect to this endpoint.
-        :param misp_url: The FQDN of a MISP instance to authenticate against.
-        :param user: The user account to authenticate.
-        :param password: The user account password.
-        :return:
-        """
-        post_data = {
-            "_method": "POST",
-            "data[_Token][key]": "",
-            "data[_Token][fields]": "",
-            "data[_Token][unlocked]": "",
-            "data[User][email]": self.id,
-            "data[User][password]": self.password,
-        }
-
-        misp_login_page = auth_host + "/users/login"
-        misp_user_me_page = auth_host + "/users/view/me.json"
-        session = requests.Session()
-        session.verify = auth_ssl_verify
-
-        # The login page contains hidden form values required for authenticaiton.
-        login_page = session.get(misp_login_page)
-
-        # This regex matches the "data[_Token][fields]" value needed to make a POST request on the MISP login page.
-        token_fields_exp = re.compile(r'name="data\[_Token]\[fields]" value="([^\s]+)"')
-        token_fields = token_fields_exp.search(login_page.text)
-
-        # This regex matches the "data[_Token][key]" value needed to make a POST request on the MISP login page.
-        token_key_exp = re.compile(r'name="data\[_Token]\[key]" value="([^\s]+)"')
-        token_key = token_key_exp.search(login_page.text)
-
-        # This regex matches the "data[_Token][debug]" value needed to make a POST request on the MISP login page.
-        token_key_exp = re.compile(r'name="data\[_Token]\[debug]" value="([^\s]+)"')
-        token_debug = token_key_exp.search(login_page.text)
-
-        post_data["data[_Token][fields]"] = token_fields.group(1)
-        post_data["data[_Token][key]"] = token_key.group(1)
-
-        # debug_token should return None when MISP debug is off.
-        # Only send debug_token when MISP is running in debug mode.
-        if token_debug is not None:
-            post_data["data[_Token][debug]"] = token_debug.group(1)
-
-        # POST request with user credentials + hidden form values.
-        post_to_login_page = session.post(misp_login_page, data=post_data, allow_redirects=False)
-        # Consider setup with MISP baseurl set
-        redirect_location = post_to_login_page.headers.get('Location', '')
-        # Authentication is successful if MISP returns a redirect to '/users/routeafterlogin'.
-        if '/users/routeafterlogin' in redirect_location:
-            # Logged in, check if logged in user can access the dashboard
-            me_json = session.get(misp_user_me_page).json()
-            dashboard_access = me_json.get('UserSetting', {}).get('dashboard_access', False)
-            if dashboard_access is True or dashboard_access == 1:
-                return (True, '')
-            else:
-                return (None, 'User does not have dashboard access')
-        return (None, '')
 
 
 @login_manager.user_loader
@@ -216,46 +156,42 @@ def login():
     Login form route.
     :return:
     """
-    if not auth_enabled:
-        # Generate a random user name and redirect the automatically authenticated user to index.
-        user = User(str(uuid.uuid4()).replace('-',''), '')
-        login_user(user)
-        return redirect(url_for('index'))
-
     if current_user.is_authenticated:
         return redirect(url_for('index'))
 
     form = LoginForm(request.form)
+
     if request.method == 'POST' and form.validate():
-        user = User(form.username.data, form.password.data)
-
-        error_message = 'Username and Password does not match when connecting to MISP or incorrect MISP permission'
         try:
-            is_logged_in, misp_error_message = user.misp_login()
-            if len(misp_error_message) > 0:
-                error_message = misp_error_message
-            if is_logged_in:
-                login_user(user)
-                return redirect(url_for('index'))
+            oauth = OAuth2Session(client_id)
+            authorization_url, state = oauth.authorization_url(authorization_base_url)
+
+            # State is used to prevent CSRF, keep this for later.
+            session['oauth_state'] = state
+            return redirect(authorization_url)
         except requests.exceptions.SSLError:
-            return redirect(url_for('login', auth_error=True, auth_error_message='MISP cannot be reached for authentication'))
+            return redirect(url_for('login', auth_error=True, auth_error_message='error'))
 
-        return redirect(url_for('login', auth_error=True, auth_error_message=error_message))
-    else:
-        auth_error = request.args.get('auth_error', False)
-        auth_error_message = request.args.get('auth_error_message', '')
-        return render_template('login.html', title='Login', form=form, authError=auth_error, authErrorMessage=auth_error_message)
+    return render_template('login.html', title='Login', form=form)
 
 
+@app.route("/callback", methods=["GET"])
+def callback():
+
+    if "oauth_state" in session:
+        oauth = OAuth2Session(client_id, state=session['oauth_state'])
+        token = oauth.fetch_token(token_url, client_secret=client_secret,
+                               authorization_response=request.url, verify=False)
+
+        session['oauth_token'] = token
+        user = User(id="Default User", password=token)
+        login_user(user)
+        return redirect(url_for('index'))
+
+    return None
 
 class LoginForm(Form):
-    """
-    WTForm form object.  This object defines form fields in the login endpoint.
-    """
-    username = StringField('Username', [validators.Length(max=255)])
-    password = PasswordField('Password', [validators.Length(max=255)])
-    submit = SubmitField('Sign In')
-
+    submit = SubmitField('Login with SSO')
 
 ##########
 ## UTIL ##
@@ -892,7 +828,7 @@ if __name__ == '__main__':
             if server_ssl_cert and server_ssl_key:
                 server_ssl_context = (server_ssl_cert, server_ssl_key)
             else:
-                server_ssl_context = 'adhoc' 
+                server_ssl_context = 'adhoc'
         else:
             server_ssl_context = None
 
